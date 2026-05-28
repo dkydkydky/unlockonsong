@@ -1,5 +1,8 @@
 // OWNER: Dave + Sam
-// Express proxy server -- attempts to call Zero CLI when configured, otherwise falls back to clear stubs
+// Express proxy server -- integrates Zero CLI for image analysis and music generation
+// Discovered capabilities:
+//   - Image: cnvrt.ing Image Analyzer (cnvrt-ing-5f6b4e95) — $0.005/call, 100% success
+//   - Music: Suno Generate Music (suno-generate-music-148a60d9) — $0.105/call, 96% success
 // Run with: npx tsx server.ts
 
 import express from 'express';
@@ -15,6 +18,10 @@ app.use(express.json({ limit: '10mb' }));
 
 const PORT = Number(process.env.PORT || 3001);
 
+// Zero capabilities (discovered via zero search + zero get)
+const ZERO_IMAGE_CAPABILITY = 'cnvrt-ing-5f6b4e95'; // cnvrt.ing Image Analyzer
+const ZERO_MUSIC_CAPABILITY = 'suno-generate-music-148a60d9'; // Suno Generate Music
+
 function runZero(args: string[]): string | null {
   try {
     // join args for exec; ensure no shell globbing issues by not using a shell string where possible
@@ -28,32 +35,50 @@ function runZero(args: string[]): string | null {
 }
 
 async function tryAnalyzeWithZero(filePath: string) {
-  const capability = process.env.ZERO_ANALYZE_CAPABILITY;
-  if (!capability) return null;
-
-  // Attempt to fetch the capability with an input file
-  const out = runZero(['fetch', capability, '--input-file', filePath, '--json']);
-  if (!out) return null;
-
+  // Use discovered capability: cnvrt.ing Image Analyzer
+  // Read file and encode as base64 for the API
   try {
-    return JSON.parse(out);
-  } catch (err) {
-    // not JSON? return raw
-    return { raw: out };
+    const fs = require('fs');
+    const imageData = fs.readFileSync(filePath);
+    const base64 = imageData.toString('base64');
+    
+    const cmd = `zero fetch --capability ${ZERO_IMAGE_CAPABILITY} -d '{"image":"data:image/jpeg;base64,${base64}"}' --json`;
+    const out = execSync(cmd, { encoding: 'utf8', stdio: 'pipe', maxBuffer: 10 * 1024 * 1024 });
+    const result = JSON.parse(out);
+    
+    if (result.ok && result.body) {
+      return result.body;
+    }
+    return null;
+  } catch (err: any) {
+    console.error('Zero image analysis failed:', err?.message || err);
+    return null;
   }
 }
 
-async function tryGenerateWithZero(inputFilePath: string) {
-  const capability = process.env.ZERO_GENERATE_CAPABILITY;
-  if (!capability) return null;
-
-  const out = runZero(['fetch', capability, '--input-file', inputFilePath, '--json']);
-  if (!out) return null;
+async function tryGenerateWithZero(prompt: string) {
+  // Use discovered capability: Suno Generate Music
+  const musicPayload = {
+    model: 'V5',
+    style: 'hip-hop, trap, empowering, energetic, stadium anthem',
+    title: 'Walk-On Anthem',
+    customMode: true,
+    instrumental: true,
+    vocalGender: 'male'
+  };
 
   try {
-    return JSON.parse(out);
-  } catch (err) {
-    return { raw: out };
+    const cmd = `zero fetch --capability ${ZERO_MUSIC_CAPABILITY} -d '${JSON.stringify(musicPayload)}' --json`;
+    const out = execSync(cmd, { encoding: 'utf8', stdio: 'pipe', maxBuffer: 10 * 1024 * 1024 });
+    const result = JSON.parse(out);
+    
+    if (result.ok && result.body) {
+      return result.body;
+    }
+    return null;
+  } catch (err: any) {
+    console.error('Zero music generation failed:', err?.message || err);
+    return null;
   }
 }
 
@@ -68,7 +93,7 @@ function writeBase64ToTempFile(dataUrl: string) {
   return tmpPath;
 }
 
-// POST /api/analyze -- receive base64 image, analyze via Zero (if configured)
+// POST /api/analyze -- receive base64 image, analyze via Zero's cnvrt.ing capability
 app.post('/api/analyze', async (req, res) => {
   let tmpPath: string | undefined;
   try {
@@ -77,36 +102,37 @@ app.post('/api/analyze', async (req, res) => {
       return res.status(400).json({ error: 'No image provided' });
     }
 
-    // If Zero capabilities are configured, attempt to call them
+    // Write image to temp file
     try {
       tmpPath = writeBase64ToTempFile(image);
     } catch (err: any) {
       return res.status(400).json({ error: 'Invalid image data' });
     }
 
+    // Try Zero image analysis capability
     const zeroResp = await tryAnalyzeWithZero(tmpPath);
     if (zeroResp) {
-      // Attempt to map common fields, but return raw when mapping not possible
+      // cnvrt.ing returns OCR text + detected objects; map to our schema
       const mapped = {
-        mood: zeroResp.mood || zeroResp.result?.mood || 'neutral',
-        energy: zeroResp.energy || zeroResp.result?.energy || 'medium',
-        colors: zeroResp.colors || zeroResp.result?.colors || [],
-        scene: zeroResp.scene || zeroResp.result?.scene || (zeroResp.description || ''),
-        keywords: zeroResp.keywords || zeroResp.result?.keywords || [],
+        mood: 'neutral',
+        energy: 'medium' as const,
+        colors: [],
+        scene: zeroResp.description || zeroResp.text || 'Scene captured',
+        keywords: zeroResp.objects || zeroResp.tags || [],
         rawDescription: JSON.stringify(zeroResp),
       };
       return res.json(mapped);
     }
 
-    // Fallback/stub response when Zero is not configured or failed
+    // Fallback/stub response
     res.json({
       mood: 'confident',
       energy: 'high',
       colors: ['blue', 'purple', 'white'],
       scene: 'person at a desk with dramatic lighting',
       keywords: ['focused', 'determined', 'bold'],
-      rawDescription: 'A confident person in a well-lit environment with cool tones. (stubbed response)',
-      _note: 'To enable real analysis set ZERO_ANALYZE_CAPABILITY and install the Zero CLI: npm i -g @zeroxyz/cli',
+      rawDescription: 'Stub response (Zero not called or analysis failed)',
+      _note: 'To enable real analysis, fund your Zero wallet: zero wallet fund --no-open',
     });
   } catch (err: any) {
     console.error('Analyze error:', err.message || err);
@@ -179,7 +205,15 @@ app.use('/generated', express.static(publicGeneratedDir));
 
 // Lightweight health and root endpoints to aid local dev and avoid 404s
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', port: PORT, zeroAnalyze: !!process.env.ZERO_ANALYZE_CAPABILITY, zeroGenerate: !!process.env.ZERO_GENERATE_CAPABILITY, suno: !!process.env.SUNO_API_KEY });
+  res.json({ 
+    status: 'ok', 
+    port: PORT, 
+    capabilities: {
+      imageAnalysis: ZERO_IMAGE_CAPABILITY,
+      musicGeneration: ZERO_MUSIC_CAPABILITY
+    },
+    _note: 'To use real capabilities, fund wallet: zero wallet fund --no-open'
+  });
 });
 
 app.get('/', (_req, res) => {
@@ -214,74 +248,49 @@ function isDataAudio(s: any) {
   return typeof s === 'string' && /^data:audio\/[a-zA-Z0-9.+-]+;base64,/.test(s);
 }
 
-// POST /api/generate -- receive prompt, generate song via Zero or save base64 audio
+// POST /api/generate -- receive prompt, generate song via Zero's Suno capability
 app.post('/api/generate', async (req, res) => {
-  let tmpInput: string | undefined;
   try {
     const { prompt } = req.body;
     if (!prompt) {
       return res.status(400).json({ error: 'No prompt provided' });
     }
 
-    // If Zero capability configured, attempt to call it
-    if (process.env.ZERO_GENERATE_CAPABILITY) {
-      const inputObj = { prompt };
-      tmpInput = join(tmpdir(), `zero-prompt-${Date.now()}.json`);
-      writeFileSync(tmpInput, JSON.stringify(inputObj));
-
-      const zeroResp = await tryGenerateWithZero(tmpInput);
-      if (zeroResp) {
-        // zeroResp might contain a remote URL, or base64 audio, or structured result
-        const maybeAudio = zeroResp.audioUrl || zeroResp.result?.audioUrl || zeroResp.url || zeroResp.audio || null;
-        const maybeTitle = zeroResp.title || zeroResp.result?.title || 'Walk-On Anthem';
-
-        if (maybeAudio) {
-          // If it's a data URL, save it locally
-          if (isDataAudio(maybeAudio)) {
-            const extMatch = (maybeAudio as string).match(/^data:audio\/(.+);base64,/);
-            const ext = extMatch ? extMatch[1].split('+')[0] : 'mp3';
-            const filename = `song-${Date.now()}.${ext}`;
-            const outPath = join(publicGeneratedDir, filename);
-            const b64 = (maybeAudio as string).split(',')[1];
-            writeFileSync(outPath, Buffer.from(b64, 'base64'));
-            const url = `${req.protocol}://${req.get('host')}/generated/${filename}`;
-            return res.json({ audioUrl: url, title: maybeTitle });
-          }
-
-          // Otherwise assume it's a remote URL and return as-is
-          return res.json({ audioUrl: maybeAudio, title: maybeTitle });
-        }
-
-        // If response shape not recognized, return raw for debugging
-        return res.json({ audioUrl: null, title: maybeTitle, raw: zeroResp });
+    // Try Zero Suno music generation capability
+    const zeroResp = await tryGenerateWithZero(prompt);
+    if (zeroResp) {
+      // Suno returns taskId; link to polling endpoint
+      const taskId = zeroResp.taskId || zeroResp.data?.data?.taskId;
+      if (taskId) {
+        // Return stub: in production, poll suno-get-music-status with taskId
+        return res.json({
+          audioUrl: null,
+          title: 'Walk-On Anthem (generating)',
+          taskId,
+          _note: 'Music generation queued; poll suno-get-music-status with taskId to get audio URL',
+        });
       }
     }
 
-    // If Suno is configured and Zero not used, attempt to call Suno via environment
-    if (process.env.SUNO_API_KEY) {
-      // Leave placeholder: integrating real Suno API requires API spec and key. Return stub with note.
-      return res.json({ audioUrl: null, title: 'Suno generation not implemented in proxy', _note: 'Set ZERO_GENERATE_CAPABILITY or implement Suno API call in server.ts' });
-    }
-
-    // Fallback stub
+    // Fallback/stub response
     res.json({
       audioUrl: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3',
       title: 'Your Walk-On Anthem (stub)',
-      _note: 'To enable real generation set ZERO_GENERATE_CAPABILITY and install the Zero CLI: npm i -g @zeroxyz/cli',
+      _note: 'To enable real generation, fund your Zero wallet: zero wallet fund --no-open',
     });
   } catch (err: any) {
     console.error('Generate error:', err.message || err);
     res.status(500).json({ error: err.message || 'Unknown error' });
-  } finally {
-    if (tmpInput) {
-      try {
-        unlinkSync(tmpInput);
-      } catch {}
-    }
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Zero proxy server running on http://localhost:${PORT}`);
-  console.log('Environment note: set ZERO_ANALYZE_CAPABILITY and ZERO_GENERATE_CAPABILITY to enable real Zero CLI calls');
+  console.log(`\n🎵 Zero proxy server running on http://localhost:${PORT}`);
+  console.log('📋 Discovered capabilities:');
+  console.log(`   - Image Analysis: ${ZERO_IMAGE_CAPABILITY} (cnvrt.ing, $0.005/call)`);
+  console.log(`   - Music Generation: ${ZERO_MUSIC_CAPABILITY} (Suno, $0.105/call)`);
+  console.log('\n💰 To activate, fund your wallet:');
+  console.log('   zero wallet fund --no-open');
+  console.log('   zero wallet balance');
+  console.log('');
 });
