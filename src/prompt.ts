@@ -24,7 +24,7 @@ const TEMPO_MAP: Record<string, string> = {
  * Build a song generation prompt from image analysis.
  * Maps visual attributes to musical ones.
  */
-export function buildSongPrompt(analysis: ImageAnalysis): string {
+export function buildSongPrompt(analysis: ImageAnalysis, _captureNumber?: number): string {
   const genre = GENRE_MAP[analysis.mood] || 'pop, electronic';
   const tempo = TEMPO_MAP[analysis.energy] || TEMPO_MAP['medium'];
   const colorVibe = analysis.colors.slice(0, 3).join(', ');
